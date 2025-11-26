@@ -1,5 +1,12 @@
 FROM gcr.io/dataflow-templates-base/python39-template-launcher-base
 
+# Libs nativas necesarias para que pyodbc se pueda importar
+RUN apt-get update && apt-get install -y \
+    unixodbc \
+    unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Código y deps Python
 COPY requirements.txt /template/requirements.txt
 COPY main.py         /template/main.py
 
