@@ -2,6 +2,7 @@ import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions
 import logging
 from google.cloud import secretmanager
+import pyodbc
 
 
 class CustomOptions(PipelineOptions):
@@ -20,11 +21,11 @@ class CustomOptions(PipelineOptions):
         parser.add_argument(
             "--output_path",
             required=True,
-            help="GCS prefix where the text files will be written, e.g. gs://my-bucket/output/secret_test",
+            help="GCS prefix where the text files will be written, e.g. gs://my-bucket/output/pyodbc_test",
         )
 
 
-class ReadSecretDoFn(beam.DoFn):
+class TestPyodbcAndSecretDoFn(beam.DoFn):
     def __init__(self, project_id: str, secret_id: str):
         self.project_id = project_id
         self.secret_id = secret_id
@@ -32,7 +33,10 @@ class ReadSecretDoFn(beam.DoFn):
         self.secret_value = None
 
     def setup(self):
-        # Crear cliente de Secret Manager una sola vez por worker
+        # Solo para ver en logs que pyodbc está disponible
+        logging.info("pyodbc version: %s", getattr(pyodbc, '__version__', 'unknown'))
+
+        # Leer el secreto una vez por worker
         self.client = secretmanager.SecretManagerServiceClient()
         name = f"projects/{self.project_id}/secrets/{self.secret_id}/versions/latest"
         response = self.client.access_secret_version(request={"name": name})
@@ -40,9 +44,9 @@ class ReadSecretDoFn(beam.DoFn):
         logging.info("Secret retrieved in setup; length=%d", len(self.secret_value))
 
     def process(self, _):
-        # Emitimos algo simple basado en el secreto
+        yield f"pyodbc import OK, version={getattr(pyodbc, '__version__', 'unknown')}"
         yield f"Secret length: {len(self.secret_value)}"
-        yield f"Secret (first 20 chars): {self.secret_value[:20]}"
+        yield f"Secret (first 50 chars): {self.secret_value[:50]}"
 
 
 def run(argv=None):
@@ -57,7 +61,7 @@ def run(argv=None):
         (
             p
             | "Start" >> beam.Create([None])
-            | "Read secret" >> beam.ParDo(ReadSecretDoFn(
+            | "Test pyodbc + secret" >> beam.ParDo(TestPyodbcAndSecretDoFn(
                 project_id=opts.project_id,
                 secret_id=opts.secret_id,
             ))
