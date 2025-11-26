@@ -11,4 +11,3 @@ docker build --no-cache -t us-central1-docker.pkg.dev/rxo-dataeng-datalake-np/da
   --staging-location "gs://rxo-dataeng-datalake-np-dataflow/staging" \
   --temp-location "gs://rxo-dataeng-datalake-np-dataflow/temp" \
   --parameters "project_id=rxo-dataeng-datalake-np,secret_id=my_test_secret,output_path=gs://rxo-dataeng-datalake-np-dataflow/test-output/secret-op"
-
