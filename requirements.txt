@@ -1,0 +1,2 @@
+# Intentionally left almost empty.
+# Apache Beam and GCP libraries come from the base image.
