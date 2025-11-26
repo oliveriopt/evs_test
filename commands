@@ -1,0 +1,22 @@
+docker build --no-cache \
+  -t us-central1-docker.pkg.dev/rxo-dataeng-datalake-np/dataflow-flex-template/test-op:latest .
+
+docker push \
+  us-central1-docker.pkg.dev/rxo-dataeng-datalake-np/dataflow-flex-template/test-op:latest
+
+gcloud dataflow flex-template build \
+  gs://rxo-dataeng-datalake-np-dataflow/templates/test-op.json \
+  --image=us-central1-docker.pkg.dev/rxo-dataeng-datalake-np/dataflow-flex-template/test-op:latest \
+  --sdk-language=PYTHON
+
+
+  gcloud dataflow flex-template run "test-op-$(date +%Y%m%d-%H%M%S)" \
+  --template-file-gcs-location "gs://rxo-dataeng-datalake-np-dataflow/templates/test-op.json" \
+  --region "us-central1" \
+  --project "rxo-dataeng-datalake-np" \
+  --service-account-email "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com" \
+  --subnetwork "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1" \
+  --disable-public-ips \
+  --staging-location "gs://rxo-dataeng-datalake-np-dataflow/staging" \
+  --temp-location "gs://rxo-dataeng-datalake-np-dataflow/temp" \
+  --parameters "output_path=gs://rxo-dataeng-datalake-np-dataflow/test-output/test"
