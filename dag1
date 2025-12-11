@@ -1,0 +1,971 @@
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List
+
+import pandas as pd
+import pendulum
+import pymssql
+from airflow.exceptions import AirflowException
+from airflow.models.dag import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+
+from include.utils.pipe_config_loader import PipeConfigLoader
+from include.utils.sqlserver_connection import get_sql_config
+
+
+# ============================================================================
+# Global configuration
+# ============================================================================
+
+TABLE_TYPE = "sqlserver_objects"
+
+config_loader = PipeConfigLoader()
+env_config = config_loader.load_configurations(TABLE_TYPE)
+
+PROJECT_ID = env_config["project_id"]
+DATAOPS_DATASET = env_config["dataops_dataset"]
+OBJECT_EXTRACTION_METADATA_TABLE = env_config[
+    "object_extraction_metadata_table_name"
+]
+REGION = env_config["region"]
+
+SECRET_ID = (
+    "rxo-dataeng-datalake-np-brokerage-fo-mssql-xpomaster-uat-creds-connection-string"
+)
+
+BQ_FINAL_TABLE = f"{PROJECT_ID}.{DATAOPS_DATASET}.lookuptable_fk_pk_analysis"
+BQ_STAGE_TABLE = f"{PROJECT_ID}.{DATAOPS_DATASET}.lookuptable_fk_pk_analysis_staging"
+BQ_ENRICHED_TABLE = f"{PROJECT_ID}.{DATAOPS_DATASET}.lookuptable_fk_pk_enriched"
+BQ_LOOKUP_TABLE = f"{PROJECT_ID}.{DATAOPS_DATASET}.lookuptable_fk_pk"
+BQ_REL_TABLE = f"{PROJECT_ID}.{DATAOPS_DATASET}.lookup_table_relationship"
+BQ_METADATA_TABLE = f"{PROJECT_ID}.{DATAOPS_DATASET}.{OBJECT_EXTRACTION_METADATA_TABLE}"
+
+logging.basicConfig(level=logging.INFO)
+
+
+# ============================================================================
+# Task 0 – Drop lookup table at start (optional reset)
+# ============================================================================
+
+
+def drop_lookup_table_at_start(**_: Any) -> None:
+    """
+    Drop the final lookup table at the beginning of the pipeline.
+
+    This ensures that the table is rebuilt from scratch on every run.
+    It is useful when we want a full refresh instead of an incremental update.
+    """
+    bq_hook = BigQueryHook(project_id=PROJECT_ID, location=REGION)
+    client = bq_hook.get_client()
+
+    client.delete_table(BQ_LOOKUP_TABLE, not_found_ok=True)
+    logging.info("Dropped lookup table %s (if it existed).", BQ_LOOKUP_TABLE)
+
+
+# ============================================================================
+# Task 1 – Extract metadata from BigQuery
+# ============================================================================
+
+
+def extract_and_process_metadata(**context: Any) -> None:
+    """
+    Extract metadata from BigQuery (extraction_metadata) and push
+    the list of (database_name, schema_name, table_name) triplets to XCom.
+
+    Only SQL Server extractions that are enabled are considered.
+    """
+    bq_hook = BigQueryHook(project_id=PROJECT_ID, location=REGION)
+    client = bq_hook.get_client()
+
+    sql_query = f"""
+        SELECT
+          JSON_EXTRACT_SCALAR(source_config, '$.database_name') AS database_name,
+          JSON_EXTRACT_SCALAR(source_config, '$.schema_name')   AS schema_name,
+          JSON_EXTRACT_SCALAR(source_config, '$.table_name')    AS table_name
+        FROM `{BQ_METADATA_TABLE}`
+        WHERE
+          source_type = 'sqlserver'
+          AND table_type = 'extraction'
+          AND enabled IS TRUE
+    """
+
+    logging.info("Executing BigQuery metadata query:\n%s", sql_query)
+
+    try:
+        job = client.query(sql_query, location=REGION)
+        rows = list(job.result())
+    except AirflowException as exc:
+        logging.error("AirflowException while executing metadata query: %s", exc)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logging.error("Unexpected error while executing metadata query: %s", exc)
+        raise
+
+    rows_dicts: List[Dict[str, Any]] = [dict(row) for row in rows]
+    df = pd.DataFrame(rows_dicts)
+
+    if df.empty:
+        logging.warning(
+            "No records found in extraction_metadata for the given filters."
+        )
+    else:
+        logging.info("Metadata extracted (sample):\n%s", df.head())
+        logging.info("Total metadata rows: %d", len(df))
+
+    context["ti"].xcom_push(key="metadata_rows", value=rows_dicts)
+
+
+# ============================================================================
+# Task 2 – Query SQL Server (PK, rowcount, distinct per column)
+# ============================================================================
+
+
+def build_and_run_sqlserver_query(**context: Any) -> None:
+    """
+    Connect to SQL Server and, based on metadata from BigQuery, compute:
+
+    - For each (database, schema, table), all columns ending in 'Id'
+      plus a flag indicating whether the column is part of the primary key.
+    - Total row count per table.
+    - Distinct count per column_id.
+
+    The result is pushed to XCom as a list of dictionaries.
+    """
+    ti = context["ti"]
+    metadata_rows = ti.xcom_pull(
+        task_ids="extract_and_process_sqlserver_metadata",
+        key="metadata_rows",
+    )
+
+    if not metadata_rows:
+        logging.warning("No metadata_rows from XCom. Nothing to process.")
+        return
+
+    df_meta = pd.DataFrame(metadata_rows)
+    logging.info("Full metadata from BigQuery (sample):\n%s", df_meta.head())
+
+    df_meta = df_meta.dropna(
+        subset=["database_name", "schema_name", "table_name"]
+    ).copy()
+
+    if df_meta.empty:
+        logging.warning("No valid rows (non-null db/schema/table). Aborting.")
+        return
+
+    df_unique = (
+        df_meta.assign(
+            database_name=lambda d: d["database_name"].astype(str).str.strip(),
+            schema_name=lambda d: d["schema_name"].astype(str).str.strip(),
+            table_name=lambda d: d["table_name"].astype(str).str.strip(),
+        )[["database_name", "schema_name", "table_name"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    logging.info("Unique (db, schema, table) triplets: %d", len(df_unique))
+
+    allowed_dbs = {"XpoMaster", "brkLTL", "XPOCustomer"}
+    df_unique = df_unique[df_unique["database_name"].isin(allowed_dbs)].reset_index(
+        drop=True
+    )
+    logging.info(
+        "Unique triplets after filtering allowed DBs (%s): %d",
+        ", ".join(sorted(allowed_dbs)),
+        len(df_unique),
+    )
+
+    if df_unique.empty:
+        logging.warning("No rows after DB filter. Nothing to query in SQL Server.")
+        return
+
+    batch_size = 10
+    pk_dfs: List[pd.DataFrame] = []
+    cnt_dfs: List[pd.DataFrame] = []
+
+    conn = None
+    try:
+        cfg = get_sql_config(SECRET_ID, PROJECT_ID)
+
+        server = (
+            cfg.get("privateIPaddress")
+            or cfg.get("publicIPaddress")
+            or cfg.get("server")
+        )
+        database = cfg.get("database", "XpoMaster")
+        username = cfg["username"]
+        password = cfg["password"]
+
+        conn = pymssql.connect(
+            server=server,
+            user=username,
+            password=password,
+            database=database,
+        )
+        cursor = conn.cursor()
+
+        for start in range(0, len(df_unique), batch_size):
+            df_batch = df_unique.iloc[start : start + batch_size].copy()
+            logging.info(
+                "Processing batch rows %d to %d",
+                start,
+                start + len(df_batch) - 1,
+            )
+            logging.info("Batch sample:\n%s", df_batch.head())
+
+            dbs_in_batch = sorted(df_batch["database_name"].unique())
+            logging.info("Databases in this batch: %s", ", ".join(dbs_in_batch))
+
+            for db in dbs_in_batch:
+                df_db = df_batch[df_batch["database_name"] == db].copy()
+                if df_db.empty:
+                    continue
+
+                logging.info("Processing DB in batch: %s", db)
+
+                values_rows = []
+                for _, row in df_db.iterrows():
+                    sch = row["schema_name"]
+                    tbl = row["table_name"]
+
+                    db_esc = db.replace("'", "''")
+                    sch_esc = sch.replace("'", "''")
+                    tbl_esc = tbl.replace("'", "''")
+
+                    values_rows.append(
+                        f"(N'{db_esc}', N'{sch_esc}', N'{tbl_esc}')"
+                    )
+
+                if not values_rows:
+                    continue
+
+                values_clause = ",\n        ".join(values_rows)
+                db_esc_for_query = db.replace("'", "''")
+
+                # PK detection: all columns ending with 'Id' + PK flag
+                pk_tsql = f"""
+                    WITH todo AS (
+                        SELECT DISTINCT
+                            LTRIM(RTRIM(DatabaseName)) AS DatabaseName,
+                            LTRIM(RTRIM(SchemaName))   AS SchemaName,
+                            LTRIM(RTRIM(TableName))    AS TableName
+                        FROM (VALUES
+                            {values_clause}
+                        ) v(DatabaseName, SchemaName, TableName)
+                    ),
+                    cols AS (
+                        SELECT
+                            DB      = N'{db_esc_for_query}',
+                            s.name  AS [Schema],
+                            t.name  AS [Table],
+                            c.name  AS column_id
+                        FROM [{db_esc_for_query}].sys.tables t
+                        JOIN [{db_esc_for_query}].sys.schemas s
+                          ON s.schema_id = t.schema_id
+                        JOIN [{db_esc_for_query}].sys.columns c
+                          ON c.object_id = t.object_id
+                        JOIN todo td
+                          ON td.SchemaName = s.name
+                         AND td.TableName  = t.name
+                        WHERE c.name LIKE N'%Id'
+                    ),
+                    pk_cols AS (
+                        SELECT
+                            s.name AS [Schema],
+                            t.name AS [Table],
+                            c.name AS column_id
+                        FROM [{db_esc_for_query}].sys.tables t
+                        JOIN [{db_esc_for_query}].sys.schemas s
+                          ON s.schema_id = t.schema_id
+                        JOIN [{db_esc_for_query}].sys.key_constraints kc
+                          ON kc.parent_object_id = t.object_id
+                         AND kc.type = 'PK'
+                        JOIN [{db_esc_for_query}].sys.index_columns ic
+                          ON ic.object_id = t.object_id
+                         AND ic.index_id = kc.unique_index_id
+                        JOIN [{db_esc_for_query}].sys.columns c
+                          ON c.object_id = ic.object_id
+                         AND c.column_id = ic.column_id
+                    ),
+                    pick AS (
+                        SELECT
+                            cols.DB      AS [Database],
+                            cols.[Schema],
+                            cols.[Table],
+                            cols.column_id,
+                            is_pk = CASE
+                                WHEN pk_cols.column_id IS NOT NULL
+                                THEN 1
+                                ELSE 0
+                            END
+                        FROM cols
+                        LEFT JOIN pk_cols
+                          ON pk_cols.[Schema]   = cols.[Schema]
+                         AND pk_cols.[Table]    = cols.[Table]
+                         AND pk_cols.column_id  = cols.column_id
+                    )
+                    SELECT [Database], [Schema], [Table], column_id, is_pk
+                    FROM pick
+                    ORDER BY [Database], [Schema], [Table], column_id;
+                """
+
+                logging.info("PK T-SQL for DB %s:\n%s", db, pk_tsql)
+                cursor.execute(pk_tsql)
+                rows_pk = cursor.fetchall()
+
+                if rows_pk:
+                    cols_pk = [col[0] for col in cursor.description]
+                    df_pk_batch_db = pd.DataFrame.from_records(
+                        rows_pk, columns=cols_pk
+                    )
+                    pk_dfs.append(df_pk_batch_db)
+                    logging.info(
+                        "PK rows retrieved for DB %s: %d",
+                        db,
+                        len(df_pk_batch_db),
+                    )
+                else:
+                    logging.warning("PK query returned no rows for DB %s.", db)
+
+                # Rowcount per table
+                counts_tsql = f"""
+                    WITH todo AS (
+                        SELECT DISTINCT
+                            LTRIM(RTRIM(DatabaseName)) AS DatabaseName,
+                            LTRIM(RTRIM(SchemaName))   AS SchemaName,
+                            LTRIM(RTRIM(TableName))    AS TableName
+                        FROM (VALUES
+                            {values_clause}
+                        ) v(DatabaseName, SchemaName, TableName)
+                    )
+                    SELECT
+                        [Database]        = N'{db_esc_for_query}',
+                        [Schema]          = s.name,
+                        [Table]           = t.name,
+                        total_rows        = SUM(p.[rows])
+                    FROM [{db_esc_for_query}].sys.tables t
+                    JOIN [{db_esc_for_query}].sys.schemas s
+                      ON s.schema_id = t.schema_id
+                    JOIN [{db_esc_for_query}].sys.partitions p
+                      ON p.object_id = t.object_id
+                    JOIN todo td
+                      ON td.SchemaName = s.name
+                     AND td.TableName  = t.name
+                    WHERE p.index_id IN (0, 1)
+                    GROUP BY s.name, t.name
+                    ORDER BY [Database], [Schema], [Table];
+                """
+
+                logging.info("Rowcount T-SQL for DB %s:\n%s", db, counts_tsql)
+                cursor.execute(counts_tsql)
+                rows_cnt = cursor.fetchall()
+
+                if rows_cnt:
+                    cols_cnt = [col[0] for col in cursor.description]
+                    df_cnt_batch_db = pd.DataFrame.from_records(
+                        rows_cnt, columns=cols_cnt
+                    )
+                    cnt_dfs.append(df_cnt_batch_db)
+                    logging.info(
+                        "Rowcount rows retrieved for DB %s: %d",
+                        db,
+                        len(df_cnt_batch_db),
+                    )
+                else:
+                    logging.warning(
+                        "Rowcount query returned no rows for DB %s.",
+                        db,
+                    )
+
+        if pk_dfs:
+            df_pk_all = pd.concat(pk_dfs, ignore_index=True)
+        else:
+            df_pk_all = pd.DataFrame(
+                columns=["Database", "Schema", "Table", "column_id", "is_pk"]
+            )
+
+        if cnt_dfs:
+            df_cnt_all = pd.concat(cnt_dfs, ignore_index=True)
+        else:
+            df_cnt_all = pd.DataFrame(
+                columns=["Database", "Schema", "Table", "total_rows"]
+            )
+
+        logging.info("Global PK DF (sample):\n%s", df_pk_all.head())
+        logging.info("Global PK rows: %d", len(df_pk_all))
+
+        logging.info("Global COUNTS DF (sample):\n%s", df_cnt_all.head())
+        logging.info("Global rowcount rows: %d", len(df_cnt_all))
+
+        if not df_pk_all.empty and not df_cnt_all.empty:
+            df_final = df_pk_all.merge(
+                df_cnt_all,
+                on=["Database", "Schema", "Table"],
+                how="left",
+            )
+        else:
+            df_final = df_pk_all.copy()
+            if "total_rows" not in df_final.columns:
+                df_final["total_rows"] = pd.NA
+
+        # DISTINCT count per column_id
+        distinct_rows: List[Dict[str, Any]] = []
+        for _, row in (
+            df_final[["Database", "Schema", "Table", "column_id"]]
+            .dropna()
+            .drop_duplicates()
+            .iterrows()
+        ):
+            db = row["Database"]
+            sch = row["Schema"]
+            tbl = row["Table"]
+            col = row["column_id"]
+
+            db_esc = str(db).replace("'", "''")
+            sch_esc = str(sch).replace("'", "''")
+            tbl_esc = str(tbl).replace("'", "''")
+            col_esc = str(col).replace("'", "''")
+
+            distinct_sql = f"""
+                SELECT DISTINCT_COUNT = COUNT(DISTINCT [{col_esc}])
+                FROM [{db_esc}].[{sch_esc}].[{tbl_esc}];
+            """
+
+            logging.info(
+                "DISTINCT T-SQL for %s.%s.%s.%s:\n%s",
+                db,
+                sch,
+                tbl,
+                col,
+                distinct_sql,
+            )
+
+            try:
+                cursor.execute(distinct_sql)
+                row_res = cursor.fetchone()
+                distinct_count = row_res[0] if row_res else None
+            except Exception as exc:  # noqa: BLE001
+                logging.error(
+                    "Error computing DISTINCT for %s.%s.%s.%s: %s",
+                    db,
+                    sch,
+                    tbl,
+                    col,
+                    exc,
+                )
+                distinct_count = None
+
+            distinct_rows.append(
+                {
+                    "Database": db,
+                    "Schema": sch,
+                    "Table": tbl,
+                    "column_id": col,
+                    "distinct_values": distinct_count,
+                }
+            )
+
+        if distinct_rows:
+            df_distinct = pd.DataFrame(distinct_rows)
+        else:
+            df_distinct = pd.DataFrame(
+                columns=[
+                    "Database",
+                    "Schema",
+                    "Table",
+                    "column_id",
+                    "distinct_values",
+                ]
+            )
+
+        logging.info(
+            "Distinct counts DF (sample):\n%s",
+            df_distinct.head(),
+        )
+        logging.info("Distinct rows: %d", len(df_distinct))
+
+        if not df_distinct.empty:
+            df_final = df_final.merge(
+                df_distinct,
+                on=["Database", "Schema", "Table", "column_id"],
+                how="left",
+            )
+        else:
+            df_final["distinct_values"] = pd.NA
+
+        logging.info(
+            "Final merged DF (PK + total_rows + distinct_values) (sample):\n%s",
+            df_final.head(),
+        )
+        logging.info("Total merged rows: %d", len(df_final))
+
+        ti.xcom_push(
+            key="pk_with_rowcounts_and_distinct",
+            value=df_final.to_dict(orient="records"),
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+            logging.info("SQL Server connection closed.")
+
+
+# ============================================================================
+# Task 3 – Write results into BigQuery (analysis table)
+# ============================================================================
+
+
+def write_results_to_bigquery(**context: Any) -> None:
+    """
+    Write the final PK + rowcount + distinct-values DataFrame into BigQuery.
+
+    Steps:
+      1. Pull records from XCom.
+      2. Load into a staging table.
+      3. Ensure the analysis table exists.
+      4. MERGE (upsert) from staging into analysis.
+      5. Drop the staging table.
+    """
+    ti = context["ti"]
+    records = ti.xcom_pull(
+        task_ids="build_and_run_sqlserver_pk_query_dynamic_batches",
+        key="pk_with_rowcounts_and_distinct",
+    )
+
+    if not records:
+        logging.warning("No records found in XCom. Nothing to write to BigQuery.")
+        return
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        logging.warning("Final DataFrame is empty. Nothing to write to BigQuery.")
+        return
+
+    df_bq = df.rename(
+        columns={
+            "Database": "database_name",
+            "Schema": "schema_name",
+            "Table": "table_name",
+            "column_id": "column_name",
+        }
+    )[
+        [
+            "database_name",
+            "schema_name",
+            "table_name",
+            "column_name",
+            "is_pk",
+            "total_rows",
+            "distinct_values",
+        ]
+    ]
+
+    df_bq["is_pk"] = pd.to_numeric(df_bq["is_pk"], errors="coerce").astype("Int64")
+    df_bq["total_rows"] = pd.to_numeric(
+        df_bq["total_rows"], errors="coerce"
+    ).astype("Int64")
+    df_bq["distinct_values"] = pd.to_numeric(
+        df_bq["distinct_values"], errors="coerce"
+    ).astype("Int64")
+
+    df_bq["load_ts"] = pd.Timestamp.utcnow()
+
+    logging.info("DataFrame to load into BigQuery (sample):\n%s", df_bq.head())
+    logging.info("Rows to write into staging table: %d", len(df_bq))
+
+    bq_hook = BigQueryHook(project_id=PROJECT_ID, location=REGION)
+    client = bq_hook.get_client()
+
+    load_job = client.load_table_from_dataframe(df_bq, BQ_STAGE_TABLE)
+    load_job.result()
+    logging.info(
+        "Loaded %d rows into staging table %s.",
+        len(df_bq),
+        BQ_STAGE_TABLE,
+    )
+
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS `{BQ_FINAL_TABLE}` (
+          database_name   STRING,
+          schema_name     STRING,
+          table_name      STRING,
+          column_name     STRING,
+          is_pk           INT64,
+          total_rows      INT64,
+          distinct_values INT64,
+          load_ts         TIMESTAMP
+        )
+    """
+    client.query(ddl, location=REGION).result()
+    logging.info("Ensured analysis table %s exists.", BQ_FINAL_TABLE)
+
+    merge_sql = f"""
+        MERGE `{BQ_FINAL_TABLE}` T
+        USING `{BQ_STAGE_TABLE}` S
+        ON T.database_name = S.database_name
+           AND T.schema_name = S.schema_name
+           AND T.table_name = S.table_name
+           AND T.column_name = S.column_name
+        WHEN MATCHED AND (
+            T.is_pk           IS DISTINCT FROM S.is_pk OR
+            T.total_rows      IS DISTINCT FROM S.total_rows OR
+            T.distinct_values IS DISTINCT FROM S.distinct_values
+        ) THEN
+          UPDATE SET
+            T.is_pk           = S.is_pk,
+            T.total_rows      = S.total_rows,
+            T.distinct_values = S.distinct_values,
+            T.load_ts         = S.load_ts
+        WHEN NOT MATCHED THEN
+          INSERT (
+            database_name,
+            schema_name,
+            table_name,
+            column_name,
+            is_pk,
+            total_rows,
+            distinct_values,
+            load_ts
+          )
+          VALUES (
+            S.database_name,
+            S.schema_name,
+            S.table_name,
+            S.column_name,
+            S.is_pk,
+            S.total_rows,
+            S.distinct_values,
+            S.load_ts
+          )
+    """
+    client.query(merge_sql, location=REGION).result()
+    logging.info("Merge completed into %s.", BQ_FINAL_TABLE)
+
+    try:
+        client.delete_table(BQ_STAGE_TABLE, not_found_ok=True)
+        logging.info("Staging table %s dropped.", BQ_STAGE_TABLE)
+    except Exception as exc:  # noqa: BLE001
+        logging.error(
+            "Error dropping staging table %s: %s",
+            BQ_STAGE_TABLE,
+            exc,
+        )
+
+
+# ============================================================================
+# Task 4 – Run SPs and basic cleanup
+# ============================================================================
+
+
+def run_sp_and_cleanup(**_: Any) -> None:
+    """
+    Execute BigQuery stored procedures that:
+
+      1. Build the enriched lookup table from the analysis table.
+      2. Copy the enriched data into the final lookup table.
+      3. Compute PK-based scores on the final lookup table.
+      4. Drop the analysis table.
+
+    Note: at this stage we DO NOT drop the enriched table so it can still
+    be inspected if required; it is safe to drop it later if desired.
+    """
+    bq_hook = BigQueryHook(project_id=PROJECT_ID, location=REGION)
+    client = bq_hook.get_client()
+
+    # 1) Build enriched table from analysis
+    sp_sql_enriched = (
+        f"CALL `{PROJECT_ID}.{DATAOPS_DATASET}.sp_build_lookup_fk_pk_enriched`();"
+    )
+    logging.info(
+        "Calling stored procedure sp_build_lookup_fk_pk_enriched: %s",
+        sp_sql_enriched,
+    )
+    client.query(sp_sql_enriched, location=REGION).result()
+    logging.info("Stored procedure sp_build_lookup_fk_pk_enriched completed.")
+
+    # 2) Copy enriched table to final lookup table
+    ddl_create_final = f"""
+        CREATE OR REPLACE TABLE `{BQ_LOOKUP_TABLE}` AS
+        SELECT *
+        FROM `{BQ_ENRICHED_TABLE}`;
+    """
+    client.query(ddl_create_final, location=REGION).result()
+    logging.info(
+        "Created/overwrote final lookup table %s from %s.",
+        BQ_LOOKUP_TABLE,
+        BQ_ENRICHED_TABLE,
+    )
+
+    # 3) Compute PK-based scores (sp_enrich_pk_scores works on lookuptable_fk_pk)
+    sp_sql_scores = f"CALL `{PROJECT_ID}.{DATAOPS_DATASET}.sp_enrich_pk_scores`();"
+    logging.info(
+        "Calling stored procedure sp_enrich_pk_scores: %s",
+        sp_sql_scores,
+    )
+    client.query(sp_sql_scores, location=REGION).result()
+    logging.info("Stored procedure sp_enrich_pk_scores completed.")
+
+    # 4) Drop analysis table (no longer needed)
+    try:
+        client.delete_table(BQ_FINAL_TABLE, not_found_ok=True)
+        logging.info("Analysis table %s dropped.", BQ_FINAL_TABLE)
+    except Exception as exc:  # noqa: BLE001
+        logging.error("Error dropping analysis table %s: %s", BQ_FINAL_TABLE, exc)
+
+
+# ============================================================================
+# Task 5 – Propagate PK info via self-join
+# ============================================================================
+
+
+def propagate_pk_info(**_: Any) -> None:
+    """
+    Call stored procedure sp_propagate_pk_info to propagate PK metrics
+    from the PK row to all related rows that share the same
+    (database_name_pk, schema_name_pk, table_name_pk, column_name_pk)
+    in the final lookup table.
+
+    This ensures that all rows for the same PK (PK row + all FKs pointing
+    to that PK) share the same PK metadata: is_pk_pk, pk_num_fk_columns,
+    pk_size_class, pk_name_score, pk_avg_fk_ratio, pk_lookup_score, etc.
+    """
+    bq_hook = BigQueryHook(project_id=PROJECT_ID, location=REGION)
+    client = bq_hook.get_client()
+
+    sp_sql = f"CALL `{PROJECT_ID}.{DATAOPS_DATASET}.sp_propagate_pk_info`();"
+    logging.info("Calling stored procedure sp_propagate_pk_info: %s", sp_sql)
+    client.query(sp_sql, location=REGION).result()
+    logging.info("Stored procedure sp_propagate_pk_info completed.")
+
+
+# ============================================================================
+# Task 6 – Compute lookup flags / labels
+# ============================================================================
+
+
+def compute_lookup_flags(**_: Any) -> None:
+    """
+    Ensure the columns is_lookup_flag and lookup_class exist on the final
+    lookup table and update them based on PK metrics.
+
+    The logic uses:
+      - is_pk_pk
+      - pk_num_fk_columns
+      - pk_size_class
+      - pk_lookup_score
+    """
+    bq_hook = BigQueryHook(project_id=PROJECT_ID, location=REGION)
+    client = bq_hook.get_client()
+
+    # Ensure new columns exist
+    alter_is_lookup = f"""
+        ALTER TABLE `{BQ_LOOKUP_TABLE}`
+        ADD COLUMN IF NOT EXISTS is_lookup_flag BOOL;
+    """
+    client.query(alter_is_lookup, location=REGION).result()
+    logging.info(
+        "Ensured column is_lookup_flag exists on %s.",
+        BQ_LOOKUP_TABLE,
+    )
+
+    alter_lookup_class = f"""
+        ALTER TABLE `{BQ_LOOKUP_TABLE}`
+        ADD COLUMN IF NOT EXISTS lookup_class STRING;
+    """
+    client.query(alter_lookup_class, location=REGION).result()
+    logging.info(
+        "Ensured column lookup_class exists on %s.",
+        BQ_LOOKUP_TABLE,
+    )
+
+    # Update flags and classes based on thresholds
+    update_sql = f"""
+        UPDATE `{BQ_LOOKUP_TABLE}`
+        SET
+          is_lookup_flag = CASE
+            WHEN is_pk_pk = 1
+             AND pk_num_fk_columns >= 1
+             AND pk_size_class IN ('SMALL', 'MEDIUM')
+             AND pk_lookup_score >= 0.6
+            THEN TRUE
+            ELSE FALSE
+          END,
+          lookup_class = CASE
+            WHEN is_pk_pk = 1
+             AND pk_num_fk_columns >= 1
+             AND pk_size_class IN ('SMALL', 'MEDIUM')
+             AND pk_lookup_score >= 0.75
+            THEN 'STRONG'
+            WHEN is_pk_pk = 1
+             AND pk_num_fk_columns >= 1
+             AND pk_size_class IN ('SMALL', 'MEDIUM')
+             AND pk_lookup_score >= 0.5
+            THEN 'CANDIDATE'
+            ELSE 'OTHER'
+          END
+        WHERE TRUE
+    """
+    client.query(update_sql, location=REGION).result()
+    logging.info(
+        "Updated is_lookup_flag and lookup_class on %s.",
+        BQ_LOOKUP_TABLE,
+    )
+
+
+# ============================================================================
+# Task 7 – Check candidates vs lookup_table_relationship and log missing ones
+# ============================================================================
+
+
+def check_lookup_candidates_and_log(**_: Any) -> None:
+    """
+    Compare lookup candidates (lookup_class = 'CANDIDATE') against the
+    lookup_table_relationship table and log an error if any candidate
+    is missing DATA TO ADD INTO PIPELINE.
+
+    This log entry is intended to be captured by Cloud Monitoring to
+    trigger alerts.
+    """
+    bq_hook = BigQueryHook(project_id=PROJECT_ID, location=REGION)
+    client = bq_hook.get_client()
+
+    sql_candidates = f"""
+        WITH candidates AS (
+          SELECT
+            database_name_pk   AS database_name,
+            schema_name_pk     AS schema_name,
+            table_name_pk      AS table_name,
+            column_name_pk     AS column_name
+          FROM `{BQ_LOOKUP_TABLE}`
+          WHERE lookup_class = 'CANDIDATE'
+            AND is_pk_pk = 1
+        ),
+        rel AS (
+          SELECT
+            database_pk,
+            schema_pk,
+            table_pk,
+            pk_name_id,
+            `DATA TO ADD INTO PIPELINE` AS data_to_add_into_pipeline
+          FROM `{BQ_REL_TABLE}`
+        )
+        SELECT
+          c.database_name,
+          c.schema_name,
+          c.table_name,
+          c.column_name,
+          r.data_to_add_into_pipeline
+        FROM candidates c
+        LEFT JOIN rel r
+          ON LOWER(r.database_pk) = LOWER(c.database_name)
+         AND LOWER(r.schema_pk)   = LOWER(c.schema_name)
+         AND LOWER(r.table_pk)    = LOWER(c.table_name)
+         AND LOWER(r.pk_name_id)  = LOWER(c.column_name)
+        WHERE r.data_to_add_into_pipeline IS NULL
+    """
+
+    logging.info(
+        "Checking lookup candidates against lookup_table_relationship..."
+    )
+    job = client.query(sql_candidates, location=REGION)
+    rows = list(job.result())
+
+    if not rows:
+        logging.info(
+            "LOOKUP_CANDIDATES_CHECK: no missing DATA TO ADD INTO PIPELINE."
+        )
+        return
+
+    missing_entries = [
+        f"{row['database_name']}.{row['schema_name']}."
+        f"{row['table_name']}.{row['column_name']}"
+        for row in rows
+    ]
+    msg = (
+        "LOOKUP_CANDIDATES_MISSING_DATA: "
+        + ", ".join(sorted(missing_entries))
+    )
+
+    # This ERROR log is what you hook your Cloud Monitoring alert to.
+    logging.error(msg)
+
+
+# ============================================================================
+# DAG definition
+# ============================================================================
+
+with DAG(
+    dag_id="bq_to_sqlserver_pk_catalog_pymssql_batches_cte_only_distinct_to_bq_v12",
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
+    catchup=False,
+    schedule=None,
+    tags=[
+        "bigquery",
+        "metadata",
+        "sqlserver",
+        "pk_catalog",
+        "rowcount",
+        "distinct_values",
+        "bq_upsert",
+        "sp_enrich",
+        "lookup_alerts",
+    ],
+) as dag:
+    drop_lookup_table_task = PythonOperator(
+        task_id="drop_lookup_table_at_start",
+        python_callable=drop_lookup_table_at_start,
+        provide_context=True,
+    )
+
+    extract_metadata_task = PythonOperator(
+        task_id="extract_and_process_sqlserver_metadata",
+        python_callable=extract_and_process_metadata,
+        provide_context=True,
+    )
+
+    run_sqlserver_pk_task = PythonOperator(
+        task_id="build_and_run_sqlserver_pk_query_dynamic_batches",
+        python_callable=build_and_run_sqlserver_query,
+        provide_context=True,
+    )
+
+    write_bq_task = PythonOperator(
+        task_id="write_pk_analysis_to_bigquery",
+        python_callable=write_results_to_bigquery,
+        provide_context=True,
+    )
+
+    sp_and_cleanup_task = PythonOperator(
+        task_id="run_sp_and_cleanup_lookup_table",
+        python_callable=run_sp_and_cleanup,
+        provide_context=True,
+    )
+
+    propagate_pk_task = PythonOperator(
+        task_id="propagate_pk_info_on_lookup_table",
+        python_callable=propagate_pk_info,
+        provide_context=True,
+    )
+
+    compute_lookup_flags_task = PythonOperator(
+        task_id="compute_lookup_flags_on_lookup_table",
+        python_callable=compute_lookup_flags,
+        provide_context=True,
+    )
+
+    check_lookup_candidates_task = PythonOperator(
+        task_id="check_lookup_candidates_and_log",
+        python_callable=check_lookup_candidates_and_log,
+        provide_context=True,
+    )
+
+    (
+        drop_lookup_table_task
+        >> extract_metadata_task
+        >> run_sqlserver_pk_task
+        >> write_bq_task
+        >> sp_and_cleanup_task
+        >> propagate_pk_task
+        >> compute_lookup_flags_task
+        >> check_lookup_candidates_task
+    )
