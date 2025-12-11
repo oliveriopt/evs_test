@@ -1,29 +1,39 @@
-CREATE OR REPLACE PROCEDURE `rxo-dataeng-datalake-np.dataops_admin.sp_propagate_pk_info`()
+CREATE OR REPLACE PROCEDURE
+  `rxo-dataeng-datalake-np.dataops_admin.sp_propagate_pk_info`()
 BEGIN
-  -- Propagar información completa de la PK a todas las filas que comparten
-  -- (database_name_pk, schema_name_pk, table_name_pk, column_name_pk)
-  UPDATE `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk_enriched` AS T
+  /*
+    For each row in lookuptable_fk_pk, copy the information of the
+    primary key row of the same table into the *_pk columns.
+
+    Join key: (database_name, schema_name, table_name)
+    The PK row is the one with is_pk = 1.
+  */
+
+  UPDATE `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk` AS t
   SET
-    T.is_pk_pk           = P.is_pk_pk,
-    T.total_rows_pk      = P.total_rows_pk,
-    T.distinct_values_pk = P.distinct_values_pk,
-    T.pk_num_fk_columns  = P.pk_num_fk_columns,
-    T.pk_size_class      = P.pk_size_class,
-    T.pk_name_score      = P.pk_name_score,
-    T.pk_avg_fk_ratio    = P.pk_avg_fk_ratio,
-    T.pk_lookup_score    = P.pk_lookup_score
-  FROM `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk_enriched` AS P
+    -- Identity of the PK
+    t.database_name_pk   = pk.database_name,
+    t.schema_name_pk     = pk.schema_name,
+    t.table_name_pk      = pk.table_name,
+    t.column_name_pk     = pk.column_name,
+
+    -- Basic PK metrics
+    t.is_pk_pk           = pk.is_pk,
+    t.total_rows_pk      = pk.total_rows,
+    t.distinct_values_pk = pk.distinct_values,
+    t.load_ts_pk         = pk.load_ts,
+
+    -- Scores and derived PK metrics
+    t.pk_num_fk_columns  = pk.pk_num_fk_columns,
+    t.pk_size_class      = pk.pk_size_class,
+    t.pk_name_score      = pk.pk_name_score,
+    t.pk_avg_fk_ratio    = pk.pk_avg_fk_ratio,
+    t.pk_lookup_score    = pk.pk_lookup_score
+  FROM `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk` AS pk
   WHERE
-    P.is_pk_pk = 1
-    AND T.database_name_pk = P.database_name_pk
-    AND T.schema_name_pk   = P.schema_name_pk
-    AND T.table_name_pk    = P.table_name_pk
-    AND T.column_name_pk   = P.column_name_pk    -- match exacto PK COLUMN
-    AND (
-      T.pk_lookup_score IS NULL
-      OR T.pk_size_class IS NULL
-      OR T.pk_num_fk_columns IS NULL
-      OR T.is_pk_pk IS NULL
-      OR T.total_rows_pk IS NULL
-    );
+    -- PK row of the same table
+    pk.is_pk = 1
+    AND t.database_name = pk.database_name
+    AND t.schema_name   = pk.schema_name
+    AND t.table_name    = pk.table_name;
 END;
