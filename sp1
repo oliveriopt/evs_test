@@ -1,0 +1,29 @@
+CREATE OR REPLACE PROCEDURE `rxo-dataeng-datalake-np.dataops_admin.sp_propagate_pk_info`()
+BEGIN
+  -- Propagar información completa de la PK a todas las filas que comparten
+  -- (database_name_pk, schema_name_pk, table_name_pk, column_name_pk)
+  UPDATE `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk_enriched` AS T
+  SET
+    T.is_pk_pk           = P.is_pk_pk,
+    T.total_rows_pk      = P.total_rows_pk,
+    T.distinct_values_pk = P.distinct_values_pk,
+    T.pk_num_fk_columns  = P.pk_num_fk_columns,
+    T.pk_size_class      = P.pk_size_class,
+    T.pk_name_score      = P.pk_name_score,
+    T.pk_avg_fk_ratio    = P.pk_avg_fk_ratio,
+    T.pk_lookup_score    = P.pk_lookup_score
+  FROM `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk_enriched` AS P
+  WHERE
+    P.is_pk_pk = 1
+    AND T.database_name_pk = P.database_name_pk
+    AND T.schema_name_pk   = P.schema_name_pk
+    AND T.table_name_pk    = P.table_name_pk
+    AND T.column_name_pk   = P.column_name_pk    -- match exacto PK COLUMN
+    AND (
+      T.pk_lookup_score IS NULL
+      OR T.pk_size_class IS NULL
+      OR T.pk_num_fk_columns IS NULL
+      OR T.is_pk_pk IS NULL
+      OR T.total_rows_pk IS NULL
+    );
+END;
