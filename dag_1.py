@@ -1,3 +1,4 @@
+Tenenos este DAG:
 from __future__ import annotations
 
 import pendulum
@@ -832,3 +833,28 @@ with DAG(
         >> compute_lookup_flags_task
         >> check_lookup_candidates_task
     )
+
+Y esta es la salida:
+
+database_name	schema_name	table_name	column_name	is_pk	total_rows	distinct_values	load_ts	database_name_pk	schema_name_pk	table_name_pk	column_name_pk	is_pk_pk	total_rows_pk	distinct_values_pk	load_ts_pk	pk_num_fk_columns	pk_size_class	pk_name_score	pk_avg_fk_ratio	pk_lookup_score	is_lookup_flag	lookup_class
+XpoMaster	orders	OrderAuditHistory	TripId	0	7210807	94076	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	locale	Address	CityId	0	19211293	34785	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	UUID	0	496334	7501	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	locale	Address	StateId	0	19211293	247	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	TripId	0	496334	449266	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	locale	Address	ZipId	0	19211293	75718	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	PayeeId	0	496334	47003	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	CurrencyId	0	496334	3	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	locale	Address	CountryId	0	19211293	62	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	OrderId	0	496334	449043	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	FinancialStatusTypeId	0	496334	7	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	AccountsPayableBatchId	0	496334	1	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	orders	OrderAuditHistory	OrderId	0	7210807	96648	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	accounting	AccountsPayable	PaymentTermsId	0	496334	16	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	locale	Address	S2CellId	0	19211293	0	2025-12-10 14:06:46.564094 UTC														false	OTHER
+XpoMaster	locale	Address	AddressId	1	19211293	19211293	2025-12-10 14:06:46.564094 UTC	XpoMaster	locale	Address	AddressId	1	19211293	19211293	2025-12-10 14:06:46.564094 UTC	1	LARGE	0	1.0	0.19030899869919438	false	OTHER
+XpoMaster	orders	OrderAuditHistory	OrderAuditHistoryId	1	7210807	7210807	2025-12-10 14:06:46.564094 UTC	XpoMaster	orders	OrderAuditHistory	OrderAuditHistoryId	1	7210807	7210807	2025-12-10 14:06:46.564094 UTC	1	LARGE	0	1.0	0.19030899869919438	false	OTHER
+XpoMaster	accounting	AccountsPayable	AccountsPayableId	1	496334	496334	2025-12-10 14:06:46.564094 UTC	XpoMaster	accounting	AccountsPayable	AccountsPayableId	1	496334	496334	2025-12-10 14:06:46.564094 UTC	1	MEDIUM	0	1.0	0.19030899869919438	false	OTHER
+
+quiero que veas inlcuyas tambien un self join para que las filas que tengan is_pk=0 se llenen con los valores: 	database_name_pk	schema_name_pk	table_name_pk donde is_pk=1.
+            Entiendes? dame el paso a paso antes.                                                                                                      
