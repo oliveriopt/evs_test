@@ -1,39 +1,56 @@
 CREATE OR REPLACE PROCEDURE
   `rxo-dataeng-datalake-np.dataops_admin.sp_propagate_pk_info`()
 BEGIN
-  /*
-    For each row in lookuptable_fk_pk, copy the information of the
-    primary key row of the same table into the *_pk columns.
-
-    Join key: (database_name, schema_name, table_name)
-    The PK row is the one with is_pk = 1.
-  */
-
-  UPDATE `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk` AS t
+  --------------------------------------------------------------------
+  -- 1) Optional: initialize *_pk fields on rows that ARE the PK
+  --    (only when those *_pk fields are still NULL).
+  --------------------------------------------------------------------
+  UPDATE
+    `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk` AS t
   SET
-    -- Identity of the PK
-    t.database_name_pk   = pk.database_name,
-    t.schema_name_pk     = pk.schema_name,
-    t.table_name_pk      = pk.table_name,
-    t.column_name_pk     = pk.column_name,
+    t.database_name_pk = t.database_name,
+    t.schema_name_pk   = t.schema_name,
+    t.table_name_pk    = t.table_name,
+    t.column_name_pk   = t.column_name
+  WHERE
+    t.is_pk = 1
+    AND t.database_name_pk IS NULL
+    AND t.schema_name_pk   IS NULL
+    AND t.table_name_pk    IS NULL
+    AND t.column_name_pk   IS NULL;
 
-    -- Basic PK metrics
+  --------------------------------------------------------------------
+  -- 2) Propagate REAL PK information:
+  --    We look for the PK row (is_pk = 1) whose (database, schema,
+  --    table, column) matches the *_pk fields of the target row.
+  --    We ONLY copy metric fields; we do NOT touch the *_pk fields.
+  --------------------------------------------------------------------
+  UPDATE
+    `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk` AS t
+  SET
+    -- PK basic metrics
     t.is_pk_pk           = pk.is_pk,
     t.total_rows_pk      = pk.total_rows,
     t.distinct_values_pk = pk.distinct_values,
     t.load_ts_pk         = pk.load_ts,
 
-    -- Scores and derived PK metrics
+    -- PK derived metrics / scores
     t.pk_num_fk_columns  = pk.pk_num_fk_columns,
     t.pk_size_class      = pk.pk_size_class,
     t.pk_name_score      = pk.pk_name_score,
     t.pk_avg_fk_ratio    = pk.pk_avg_fk_ratio,
     t.pk_lookup_score    = pk.pk_lookup_score
-  FROM `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk` AS pk
+  FROM
+    `rxo-dataeng-datalake-np.dataops_admin.lookuptable_fk_pk` AS pk
   WHERE
-    -- PK row of the same table
     pk.is_pk = 1
-    AND t.database_name = pk.database_name
-    AND t.schema_name   = pk.schema_name
-    AND t.table_name    = pk.table_name;
+    -- match against the reference PK (stored in *_pk fields)
+    AND t.database_name_pk IS NOT NULL
+    AND t.schema_name_pk   IS NOT NULL
+    AND t.table_name_pk    IS NOT NULL
+    AND t.column_name_pk   IS NOT NULL
+    AND t.database_name_pk = pk.database_name
+    AND t.schema_name_pk   = pk.schema_name
+    AND t.table_name_pk    = pk.table_name
+    AND t.column_name_pk   = pk.column_name;
 END;
